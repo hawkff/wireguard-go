@@ -95,6 +95,7 @@ func (device *Device) PutOutboundElementsContainer(c *QueueOutboundElementsConta
 		c.elems[i] = nil
 	}
 	c.elems = c.elems[:0]
+	c.awg = nil
 	device.pool.outboundElementsContainer.Put(c)
 }
 

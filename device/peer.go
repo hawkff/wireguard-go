@@ -57,6 +57,7 @@ type Peer struct {
 		zeroKeyMaterial         *Timer
 		persistentKeepalive     *Timer
 		handshakeAttempts       atomic.Uint32
+		maxHandshakeAttempts    atomic.Uint32
 		needAnotherKeepalive    atomic.Bool
 		sentLastMinuteHandshake atomic.Bool
 	}
@@ -80,7 +81,8 @@ type Peer struct {
 
 	cookieGenerator             CookieGenerator
 	trieEntries                 list.List
-	persistentKeepaliveInterval atomic.Uint32
+	persistentKeepaliveInterval AtomicUintRange
+	udpWindow                   atomic.Uint32
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
@@ -102,6 +104,8 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 
 	// create peer
 	peer := new(Peer)
+
+	peer.udpWindow.Store(DefaultUdpWindow)
 
 	peer.cookieGenerator.Init(pk)
 	peer.device = device
@@ -244,7 +248,7 @@ func (peer *Peer) Start() {
 	peer.queuedOutboundPackets.Store(0)
 
 	peer.handshake.mutex.Lock()
-	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
+	peer.handshake.lastSentHandshake = time.Now().Add(-(peer.device.rekeyMinTimeout() + time.Second))
 	peer.handshake.mutex.Unlock()
 
 	peer.device.queue.encryption.wg.Add(1) // keep encryption queue open for our writes
@@ -264,10 +268,10 @@ func (peer *Peer) Start() {
 
 	// A lazily-created peer that never completes a handshake otherwise never
 	// arms its reaping timer. Arm it here, while running under state.Lock, so
-	// it's reclaimed after RejectAfterTime*3 of no session and is guaranteed to
+	// it's reclaimed after three keychain lifetimes with no session and is guaranteed to
 	// be torn down by a matching Stop. A completed handshake re-Mods it.
 	if peer.deleteOnIdle {
-		peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
+		peer.timers.zeroKeyMaterial.Mod(peer.device.keychainExpireTime() * 3)
 	}
 }
 
@@ -310,7 +314,7 @@ func (peer *Peer) ExpireCurrentKeypairs() {
 	handshake.mutex.Lock()
 	peer.device.indexTable.Delete(handshake.localIndex)
 	handshake.Clear()
-	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
+	peer.handshake.lastSentHandshake = time.Now().Add(-(peer.device.rekeyMinTimeout() + time.Second))
 	handshake.mutex.Unlock()
 
 	keypairs := &peer.keypairs
@@ -474,6 +478,14 @@ func (peer *Peer) sendHandshakeBuffers(buffers [][]byte, candidates []conn.Endpo
 		return nil
 	}
 	return firstErr
+}
+
+func (peer *Peer) growUDPWindow(window uint32) {
+	for current := peer.udpWindow.Load(); current < window; current = peer.udpWindow.Load() {
+		if peer.udpWindow.CompareAndSwap(current, window) {
+			return
+		}
+	}
 }
 
 func (peer *Peer) markEndpointSrcForClearing() {

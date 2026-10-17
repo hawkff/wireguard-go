@@ -15,6 +15,7 @@ import (
 	"github.com/sagernet/wireguard-go/conn"
 	"github.com/sagernet/wireguard-go/tai64n"
 	"golang.org/x/crypto/blake2s"
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/poly1305"
 )
@@ -54,10 +55,18 @@ const (
 )
 
 const (
-	MessageInitiationType  = 1
-	MessageResponseType    = 2
-	MessageCookieReplyType = 3
-	MessageTransportType   = 4
+	MessageUnknownType     uint32 = 0
+	MessageInitiationType         = 1
+	MessageResponseType           = 2
+	MessageCookieReplyType        = 3
+	MessageTransportType          = 4
+)
+
+const (
+	DefaultMessageInitiationType  = MessageInitiationType
+	DefaultMessageResponseType    = MessageResponseType
+	DefaultMessageCookieReplyType = MessageCookieReplyType
+	DefaultMessageTransportType   = MessageTransportType
 )
 
 const (
@@ -269,6 +278,10 @@ func init() {
 }
 
 func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, error) {
+	return device.createMessageInitiation(peer, device.getAWGConfig())
+}
+
+func (device *Device) createMessageInitiation(peer *Peer, awg *awgConfig) (*MessageInitiation, error) {
 	device.staticIdentity.RLock()
 	defer device.staticIdentity.RUnlock()
 
@@ -288,7 +301,7 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	handshake.mixHash(handshake.remoteStatic[:])
 
 	msg := MessageInitiation{
-		Type:      MessageInitiationType,
+		Type:      awg.headers.init.PickOne(),
 		Ephemeral: handshake.localEphemeral.publicKey(),
 	}
 
@@ -453,6 +466,10 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation, endpoint 
 }
 
 func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error) {
+	return device.createMessageResponse(peer, device.getAWGConfig())
+}
+
+func (device *Device) createMessageResponse(peer *Peer, awg *awgConfig) (*MessageResponse, error) {
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
 	defer handshake.mutex.Unlock()
@@ -471,7 +488,7 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	}
 
 	var msg MessageResponse
-	msg.Type = MessageResponseType
+	msg.Type = awg.headers.response.PickOne()
 	msg.Sender = handshake.localIndex
 	msg.Receiver = handshake.remoteIndex
 
@@ -729,4 +746,12 @@ func (peer *Peer) ReceivedWithKeypair(receivedKeypair *Keypair) bool {
 	keypairs.current = keypairs.next.Load()
 	keypairs.next.Store(nil)
 	return true
+}
+
+func (cfg *awgConfig) HeaderProtectionCipher(salt []byte) (*chacha20.Cipher, error) {
+	if cfg.headerProtectionKey.IsZero() {
+		return nil, nil
+	}
+
+	return chacha20.NewUnauthenticatedCipher(cfg.headerProtectionKey[:], salt)
 }

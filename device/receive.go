@@ -33,6 +33,7 @@ type QueueInboundElement struct {
 	counter  uint64
 	keypair  *Keypair
 	endpoint conn.Endpoint
+	padding  uint32
 }
 
 type QueueInboundElementsContainer struct {
@@ -65,7 +66,8 @@ func (peer *Peer) keepKeyFreshReceiving() {
 		return
 	}
 	keypair := peer.keypairs.Current()
-	if keypair != nil && keypair.isInitiator && time.Since(keypair.created) > (RejectAfterTime-KeepaliveTimeout-RekeyTimeout) {
+
+	if keypair != nil && keypair.isInitiator && time.Since(keypair.created) > peer.device.keyRefreshTimeoutReceiving() {
 		peer.timers.sentLastMinuteHandshake.Store(true)
 		peer.SendHandshakeInitiation(false)
 	}
@@ -98,6 +100,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 		endpoints   = make([]conn.Endpoint, maxBatchSize)
 		deathSpiral int
 		elemsByPeer = make(map[*Peer]*QueueInboundElementsContainer, maxBatchSize)
+		typeHashBuf [4]byte
 	)
 
 	for i := range bufsArrs {
@@ -142,10 +145,34 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				continue
 			}
 
-			// check size of packet
-
 			packet := bufsArrs[i][:size]
-			msgType := binary.LittleEndian.Uint32(packet[:4])
+			awg := device.getAWGConfig()
+			cip, cipherErr := awg.HeaderProtectionCipher(packet[:HeaderCipherNonceSize])
+			if cipherErr != nil {
+				device.log.Errorf("Failed to initialize header cipher")
+				continue
+			}
+
+			typeHash := typeHashBuf[:]
+			clear(typeHash)
+			if cip != nil {
+				cip.XORKeyStream(typeHash, typeHash)
+			}
+
+			// get message padding and type based on information from S1-S4 and H1-H4
+			msgSize, msgType, padding := determinePacketTypeAndPadding(packet, MessageUnknownType, typeHash, awg)
+			if msgType == MessageUnknownType {
+				device.log.Verbosef("Received message with unknown AWG type (size %d)", len(packet))
+				continue
+			}
+			packet = packet[int(padding):]
+			if msgType != MessageTransportType {
+				packet = packet[:msgSize]
+			}
+
+			if cip != nil {
+				applyHash(packet[:4], packet[:4], typeHash)
+			}
 
 			switch msgType {
 
@@ -157,6 +184,9 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 				if len(packet) < MessageTransportSize {
 					continue
+				}
+				if cip != nil {
+					cip.XORKeyStream(packet[4:MessageTransportHeaderSize], packet[4:MessageTransportHeaderSize])
 				}
 
 				// lookup key pair
@@ -172,7 +202,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 				// check keypair expiry
 
-				if keypair.created.Add(RejectAfterTime).Before(time.Now()) {
+				if keypair.created.Add(device.keychainExpireTime()).Before(time.Now()) {
 					continue
 				}
 
@@ -184,6 +214,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				elem.keypair = keypair
 				elem.endpoint = endpoints[i]
 				elem.counter = 0
+				elem.padding = padding
 
 				elemsForPeer, ok := elemsByPeer[peer]
 				if !ok {
@@ -201,15 +232,24 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				if len(packet) != MessageInitiationSize {
 					continue
 				}
+				if cip != nil {
+					cip.XORKeyStream(packet[4:MessageInitiationSize], packet[4:MessageInitiationSize])
+				}
 
 			case MessageResponseType:
 				if len(packet) != MessageResponseSize {
 					continue
 				}
+				if cip != nil {
+					cip.XORKeyStream(packet[4:MessageResponseSize], packet[4:MessageResponseSize])
+				}
 
 			case MessageCookieReplyType:
 				if len(packet) != MessageCookieReplySize {
 					continue
+				}
+				if cip != nil {
+					cip.XORKeyStream(packet[4:MessageCookieReplySize], packet[4:MessageCookieReplySize])
 				}
 
 			default:
@@ -270,6 +310,7 @@ func (device *Device) RoutineDecryption(id int) {
 				nil,
 			)
 			if err != nil {
+				device.log.Verbosef("Failed to decrypt transport packet")
 				elem.packet = nil
 			}
 		}
@@ -332,13 +373,14 @@ func (device *Device) RoutineHandshake(id int) {
 			}
 
 			// endpoints destination address is the source of the datagram
-
-			if device.IsUnderLoad() {
+			if !device.getAWGConfig().disableCookies && device.IsUnderLoad() {
 
 				// verify MAC2 field
 
 				if !device.cookieChecker.CheckMAC2(elem.packet, elem.endpoint.DstToBytes()) {
-					device.SendHandshakeCookie(&elem)
+					if err := device.SendHandshakeCookie(&elem); err != nil {
+						device.log.Verbosef("Failed to send cookie response: %v", err)
+					}
 					goto skip
 				}
 
@@ -367,6 +409,7 @@ func (device *Device) RoutineHandshake(id int) {
 				device.log.Errorf("Failed to decode initiation message")
 				goto skip
 			}
+			msg.Type = elem.msgType
 
 			// consume initiation
 
@@ -399,6 +442,7 @@ func (device *Device) RoutineHandshake(id int) {
 				device.log.Errorf("Failed to decode response message")
 				goto skip
 			}
+			msg.Type = elem.msgType
 
 			// consume response
 
@@ -505,8 +549,9 @@ func (peer *Peer) processInboundContainer(elemsContainer *QueueInboundElementsCo
 			ep.FromPeer(peer.handshake.remoteStatic)
 		}
 		rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
+		peer.growUDPWindow(elem.padding + MinMessageSize + uint32(len(elem.packet)))
 
-		if len(elem.packet) == 0 {
+		if len(elem.packet) == 0 || elem.packet[0] == 0 {
 			device.log.Verbosef("%v - Receiving keepalive packet", peer)
 			continue
 		}
@@ -547,13 +592,13 @@ func (peer *Peer) processInboundContainer(elemsContainer *QueueInboundElementsCo
 				device.log.Verbosef("IPv6 packet with disallowed source address from %v", peer)
 				continue
 			}
-
 		default:
 			device.log.Verbosef("Packet with invalid IP version from %v", peer)
 			continue
 		}
 
-		scratch = append(scratch, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
+		start := int(elem.padding)
+		scratch = append(scratch, elem.buffer[start:start+MessageTransportOffsetContent+len(elem.packet)])
 	}
 
 	peer.rxBytes.Add(rxBytesLen)
@@ -576,4 +621,81 @@ func (peer *Peer) processInboundContainer(elemsContainer *QueueInboundElementsCo
 		device.PutMessageBuffer(elem.buffer)
 		device.PutInboundElement(elem)
 	}
+}
+
+func applyHash(dst, src, hash []byte) {
+	for i := range dst {
+		dst[i] = src[i] ^ hash[i]
+	}
+}
+
+// DeterminePacketTypeAndPadding identifies an AWG packet using the current
+// device configuration. typeHash is optional for compatibility with callers
+// that do not use AWG v3 header protection.
+func (device *Device) DeterminePacketTypeAndPadding(packet []byte, expectedType uint32, typeHashArg ...[]byte) (uint32, uint32) {
+	var typeHash [4]byte
+	if len(typeHashArg) > 0 && len(typeHashArg[0]) >= len(typeHash) {
+		copy(typeHash[:], typeHashArg[0][:len(typeHash)])
+	}
+	_, msgType, padding := determinePacketTypeAndPadding(packet, expectedType, typeHash[:], device.getAWGConfig())
+	return msgType, padding
+}
+
+func determinePacketTypeAndPadding(packet []byte, expectedType uint32, typeHash []byte, awg *awgConfig) (int, uint32, uint32) {
+	var headerBytes [4]byte
+	size := len(packet)
+
+	if expectedType == MessageUnknownType || expectedType == MessageInitiationType {
+		padding := awg.paddings.init
+		header := awg.headers.init
+		expectedSize := int(padding) + MessageInitiationSize
+
+		if size == expectedSize || awg.randomTrailers && size > expectedSize {
+			applyHash(headerBytes[:], packet[padding:padding+4], typeHash)
+			if header.Contains(binary.LittleEndian.Uint32(headerBytes[:])) {
+				return MessageInitiationSize, MessageInitiationType, padding
+			}
+		}
+	}
+
+	if expectedType == MessageUnknownType || expectedType == MessageResponseType {
+		padding := awg.paddings.response
+		header := awg.headers.response
+		expectedSize := int(padding) + MessageResponseSize
+
+		if size == expectedSize || awg.randomTrailers && size > expectedSize {
+			applyHash(headerBytes[:], packet[padding:padding+4], typeHash)
+			if header.Contains(binary.LittleEndian.Uint32(headerBytes[:])) {
+				return MessageResponseSize, MessageResponseType, padding
+			}
+		}
+	}
+
+	if expectedType == MessageUnknownType || expectedType == MessageCookieReplyType {
+		padding := awg.paddings.cookie
+		header := awg.headers.cookie
+		expectedSize := int(padding) + MessageCookieReplySize
+
+		if size == expectedSize || awg.randomTrailers && size > expectedSize {
+			applyHash(headerBytes[:], packet[padding:padding+4], typeHash)
+			if header.Contains(binary.LittleEndian.Uint32(headerBytes[:])) {
+				return MessageCookieReplySize, MessageCookieReplyType, padding
+			}
+		}
+	}
+
+	if expectedType == MessageUnknownType || expectedType == MessageTransportType {
+		padding := awg.paddings.transport
+		header := awg.headers.transport
+		expectedSize := int(padding) + MessageTransportSize
+
+		if size >= expectedSize {
+			applyHash(headerBytes[:], packet[padding:padding+4], typeHash)
+			if header.Contains(binary.LittleEndian.Uint32(headerBytes[:])) {
+				return MessageTransportSize, MessageTransportType, padding
+			}
+		}
+	}
+
+	return 0, MessageUnknownType, 0
 }
