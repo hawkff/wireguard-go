@@ -686,7 +686,7 @@ func (device *Device) SendKeepalivesToPeersWithCurrentKeypair() {
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
 		peer.keypairs.RLock()
-		sendKeepalive := peer.keypairs.current != nil && !peer.keypairs.current.created.Add(timeout).Before(time.Now())
+		sendKeepalive := peer.keypairs.current != nil && sinceIncludingSleep(peer.keypairs.current.created) <= timeout
 		peer.keypairs.RUnlock()
 		if sendKeepalive {
 			peers = append(peers, peer)
